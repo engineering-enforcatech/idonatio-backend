@@ -24,10 +24,7 @@ const userSchema = new mongoose.Schema({
             message: 'Please provide a valid email'
         }
     },
-    organizationName: {
-        type: String,
-        required: true,
-    },
+
     password: {
         type: String,
         required: true,
@@ -46,7 +43,6 @@ const userSchema = new mongoose.Schema({
     },
     postalCode: {
         type: Number,
-        unique: true,
         minlength: 5,
         maxlength: 5
     },

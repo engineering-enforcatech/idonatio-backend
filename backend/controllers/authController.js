@@ -5,15 +5,10 @@ import validator from "validator";
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
 
-
 const signToken = (id) => {
     return jwt.sign({ id }, process.env.JWT_SECRET, {
         expiresIn: process.env.JWT_EXPIRES_IN
     });
-};
-
-const hashedPassword = async (password) => {
-    return await bcrypt.hash(password, 12);
 };
 
 // Step 1: Handle user type selection
@@ -28,14 +23,20 @@ export const selectUserType = async (req, res) => {
             });
         }
 
-        // Store user type in session to use in next step
-        req.session.signupData = { doneeType };
+        // Create a temporary JWT token containing the user type
+        const tempToken = jwt.sign(
+            { doneeType, purpose: 'user-type-selection' },
+            process.env.JWT_SECRET,
+            { expiresIn: '15m' } // Token expires in 15 minutes
+        );
 
         res.status(200).json({
             status: "success",
-            message: "User type selected successfully"
+            message: "User type selected successfully",
+            tempToken // Send the token to the client
         });
     } catch (err) {
+        console.error("Error in selectUserType:", err);
         res.status(500).json({
             status: "error",
             message: "Something went wrong"
@@ -43,9 +44,34 @@ export const selectUserType = async (req, res) => {
     }
 };
 
+
 // Step 2: Handle user registration form
 export const registerUser = async (req, res) => {
     try {
+        const authHeader = req.headers['authorization'];
+        if (!authHeader || !authHeader.startsWith('Bearer ')) {
+            return res.status(401).json({
+                status: "fail",
+                message: "No authorization token provided"
+            });
+        }
+
+        const tempToken = authHeader.split(' ')[1].trim();
+
+        const decoded = jwt.verify(tempToken, process.env.JWT_SECRET, {
+            algorithms: ['HS256'],
+            ignoreExpiration: false
+        });
+
+
+        if (decoded.purpose !== 'user-type-selection') {
+            return res.status(401).json({
+                status: "fail",
+                message: "Invalid token purpose"
+            });
+        }
+
+        const { doneeType } = decoded;
         const {
             firstName,
             lastName,
@@ -54,18 +80,10 @@ export const registerUser = async (req, res) => {
             nin,
             email,
             password,
-            confirmPassword,
-            organizationName
+            confirmPassword
         } = req.body;
 
         // Validation checks
-        if (!doneeType || !["individual", "organization"].includes(doneeType)) {
-            return res.status(400).json({
-                status: "fail",
-                message: "Please select a valid user type (individual or organization)"
-            });
-        }
-
         if (password !== confirmPassword) {
             return res.status(400).json({
                 status: "fail",
@@ -80,7 +98,6 @@ export const registerUser = async (req, res) => {
             });
         }
 
-        // Check if user already exists
         const existingUser = await User.findOne({ email });
         if (existingUser) {
             return res.status(400).json({
@@ -89,7 +106,8 @@ export const registerUser = async (req, res) => {
             });
         }
 
-        // Create user data object
+        const hashedPassword = await bcrypt.hash(password, 12);
+
         const userData = {
             firstName,
             lastName,
@@ -98,32 +116,40 @@ export const registerUser = async (req, res) => {
             nin,
             email,
             password: hashedPassword,
-            doneeType: req.session.signupData.doneeType,
+            doneeType,
             role: "donee",
-            isVerified: false,
+            isVerified: false
         };
 
-        // Generate and send verification code
+        // Save user to database
+        await User.create(userData);
+
         const verificationCode = generateVerificationCode(email);
         await sendVerificationEmail(email, verificationCode);
 
-        // Create temporary token for verification step
-        const tempToken = jwt.sign(
+        // Create a temporary JWT token for verification
+        const verificationToken = jwt.sign(
             { email, purpose: 'verification' },
             process.env.JWT_SECRET,
-            { expiresIn: '15m' } // Same as verification code expiration
+            { expiresIn: '15m' }
         );
 
 
         res.status(200).json({
             status: "success",
-            message: "Verification code sent to email"
+            message: "Verification code sent to email",
+            tempToken: verificationToken // Send the verification token to the client
         });
     } catch (err) {
-        res.status(500).json({
-            status: "error",
-            message: "Something went wrong during registration"
+
+        console.error("FULL MONGOOSE ERROR:", {
+            name: err.name,
+            message: err.message,
+            code: err.code,
+            keyPattern: err.keyPattern,  // Shows which field caused duplicate key
+            stack: err.stack
         });
+        throw err;
     }
 };
 
@@ -132,7 +158,6 @@ export const verifyUser = async (req, res) => {
     try {
         const { verificationCode, tempToken } = req.body;
 
-        // Verify the temporary token
         const decoded = jwt.verify(tempToken, process.env.JWT_SECRET);
         if (decoded.purpose !== 'verification') {
             return res.status(401).json({
@@ -141,19 +166,7 @@ export const verifyUser = async (req, res) => {
             });
         }
 
-
-        const { userData } = req.session.signupData || {};
-
-        if (!userData) {
-            return res.status(400).json({
-                status: "fail",
-                message: "Registration session expired. Please start again."
-            });
-        }
-
         const { email } = decoded;
-
-        // Verify the code
         const isVerified = verifyCode(email, verificationCode);
 
         if (!isVerified) {
@@ -163,7 +176,6 @@ export const verifyUser = async (req, res) => {
             });
         }
 
-        // Update user to verified
         const user = await User.findOneAndUpdate(
             { email },
             { isVerified: true },
@@ -177,69 +189,7 @@ export const verifyUser = async (req, res) => {
             });
         }
 
-        // Create proper JWT token for authentication
         const token = signToken(user._id);
-
-        // Remove password from output
-        user.password = undefined;
-
-        res.status(201).json({
-            status: "success",
-            token,
-            data: {
-                user
-            }
-        });
-    } catch (err) {
-        if (err.name === 'JsonWebTokenError') {
-            return res.status(401).json({
-                status: "fail",
-                message: "Invalid or expired token. Please register again."
-            });
-        }
-        res.status(500).json({
-            status: "error",
-            message: "Something went wrong during verification"
-        });
-    }
-};
-
-
-// Login controller (additional)
-export const login = async (req, res) => {
-    try {
-        const { email, password } = req.body;
-
-        // 1) Check if email and password exist
-        if (!email || !password) {
-            return res.status(400).json({
-                status: "fail",
-                message: "Please provide email and password"
-            });
-        }
-
-        // 2) Check if user exists && password is correct
-        const user = await User.findOne({ email }).select('+password');
-
-        if (!user || !(await bcrypt.compare(password, user.password))) {
-            return res.status(401).json({
-                status: "fail",
-                message: "Incorrect email or password"
-            });
-        }
-
-        // 3) Check if user is verified
-        if (!user.isVerified) {
-            return res.status(401).json({
-                status: "fail",
-                message: "Account not verified. Please verify your email."
-            });
-        }
-
-        // 4) If everything ok, send token to client
-        const token = signToken(user._id);
-
-        // Remove password from output
         user.password = undefined;
 
         res.status(200).json({
@@ -250,60 +200,116 @@ export const login = async (req, res) => {
             }
         });
     } catch (err) {
-        res.status(500).json({
+        console.error("Verification Error:", err);
+
+        let errorMessage = "Something went wrong during verification";
+        if (err.name === 'JsonWebTokenError') {
+            errorMessage = "Invalid or expired token";
+        }
+
+        res.status(err.statusCode || 500).json({
             status: "error",
-            message: "Something went wrong during login"
+            message: errorMessage,
+            ...(process.env.NODE_ENV === 'development' && { error: err.message })
         });
     }
 };
 
+// Login controller
+export const login = async (req, res) => {
+    try {
+        const { email, password } = req.body;
 
-// Protect middleware (for protected routes)
+        if (!email || !password) {
+            return res.status(400).json({
+                status: "fail",
+                message: "Please provide email and password"
+            });
+        }
+
+        const user = await User.findOne({ email }).select('+password');
+        if (!user || !(await bcrypt.compare(password, user.password))) {
+            return res.status(401).json({
+                status: "fail",
+                message: "Incorrect email or password"
+            });
+        }
+
+        if (!user.isVerified) {
+            return res.status(401).json({
+                status: "fail",
+                message: "Account not verified. Please verify your email."
+            });
+        }
+
+        const token = signToken(user._id);
+        user.password = undefined;
+
+        res.status(200).json({
+            status: "success",
+            token,
+            data: {
+                user
+            }
+        });
+    } catch (err) {
+        console.error("Login Error:", err);
+        res.status(500).json({
+            status: "error",
+            message: "Something went wrong during login",
+            ...(process.env.NODE_ENV === 'development' && { error: err.message })
+        });
+    }
+};
+
+// Protect middleware
 export const protect = async (req, res, next) => {
     try {
-        // 1) Getting token and check if it's there
         let token;
-        if (
-            req.headers.authorization &&
-            req.headers.authorization.startsWith('Bearer')
-        ) {
+        if (req.headers.authorization?.startsWith('Bearer')) {
             token = req.headers.authorization.split(' ')[1];
         }
 
         if (!token) {
             return res.status(401).json({
                 status: "fail",
-                message: "You are not logged in! Please log in to get access."
+                message: "Please log in to access this resource"
             });
         }
 
-        // 2) Verification token
         const decoded = jwt.verify(token, process.env.JWT_SECRET);
-
-        // 3) Check if user still exists
         const currentUser = await User.findById(decoded.id);
+
         if (!currentUser) {
             return res.status(401).json({
                 status: "fail",
-                message: "The user belonging to this token no longer exists."
+                message: "User no longer exists"
             });
         }
 
-        // 4) Check if user changed password after the token was issued
         if (currentUser.changedPasswordAfter(decoded.iat)) {
             return res.status(401).json({
                 status: "fail",
-                message: "User recently changed password! Please log in again."
+                message: "Password changed recently. Please log in again."
             });
         }
 
-        // GRANT ACCESS TO PROTECTED ROUTE
         req.user = currentUser;
         next();
     } catch (err) {
+        console.error("Protect Middleware Error:", err);
+
+        let errorMessage = "Authentication failed";
+        if (err.name === "JsonWebTokenError") {
+            errorMessage = "Invalid token";
+        } else if (err.name === "TokenExpiredError") {
+            errorMessage = "Session expired. Please log in again.";
+        }
+
         res.status(401).json({
             status: "fail",
-            message: "Invalid token. Please log in again."
+            message: errorMessage,
+            ...(process.env.NODE_ENV === 'development' && { error: err.message })
         });
     }
 };
